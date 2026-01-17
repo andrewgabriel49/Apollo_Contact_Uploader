@@ -60,6 +60,18 @@ class ApolloBatchUploader:
             logger.error(f"Unexpected error: {str(e)}")
             raise
 
+    def wait_for_enrichment(self, minutes: int = 15):
+        """Wait for Apollo to process and potentially enrich contacts."""
+        logger.info(f"Waiting {minutes} minutes for Apollo to process contacts...")
+        
+        total_seconds = minutes * 60
+        for remaining in range(total_seconds, 0, -30):  # Update every 30 seconds
+            mins, secs = divmod(remaining, 60)
+            logger.info(f"Time remaining: {mins}m {secs}s")
+            time.sleep(30)
+        
+        logger.info("Wait complete! Starting cleanup...")
+
     def get_label_by_name(self, list_name: str) -> Optional[str]:
         """Get label ID by name if it exists."""
         url = f"{self.base_url}/labels"
@@ -213,6 +225,135 @@ class ApolloBatchUploader:
         
         logger.info(f"Upload complete: {successful} successful, {failed} failed out of {total_leads} total")
 
+    def get_contacts_in_label(self, label_id: str) -> List[Dict]:
+        """Fetch all contacts in a specific label."""
+        url = f"{self.base_url}/contacts/search"
+        all_contacts = []
+        page = 1
+        
+        logger.info(f"Fetching contacts from label {label_id}...")
+        
+        while True:
+            payload = {
+                "label_ids": [label_id],
+                "page": page,
+                "per_page": 100  # Max per page
+            }
+            
+            try:
+                response = requests.post(url, headers=self.headers, json=payload)
+                data = self._handle_response(response)
+                
+                contacts = data.get('contacts', [])
+                if not contacts:
+                    break
+                
+                all_contacts.extend(contacts)
+                logger.info(f"Fetched page {page}: {len(contacts)} contacts")
+                
+                # Check if there are more pages
+                pagination = data.get('pagination', {})
+                if not pagination.get('page') or pagination.get('page') >= pagination.get('total_pages', 0):
+                    break
+                
+                page += 1
+                time.sleep(1)  # Rate limiting
+                
+            except Exception as e:
+                logger.error(f"Error fetching contacts: {e}")
+                break
+        
+        logger.info(f"Total contacts fetched: {len(all_contacts)}")
+        return all_contacts
+
+    def delete_unenriched_contacts(self, label_id: str) -> int:
+        """Delete contacts without first_name, last_name, OR organization_name."""
+        contacts = self.get_contacts_in_label(label_id)
+        
+        to_delete = []
+        to_keep = []
+        
+        for contact in contacts:
+            first_name = contact.get('first_name', '').strip()
+            last_name = contact.get('last_name', '').strip()
+            org_name = contact.get('organization_name', '').strip()
+            
+            # Keep if has ANY of: first name, last name, or company
+            if first_name or last_name or org_name:
+                to_keep.append(contact)
+            else:
+                to_delete.append(contact)
+        
+        logger.info(f"Analysis: {len(to_keep)} contacts to keep (enriched), {len(to_delete)} to delete (not enriched)")
+        
+        if not to_delete:
+            logger.info("No unenriched contacts to delete!")
+            return 0
+        
+        # Delete unenriched contacts
+        deleted_count = 0
+        for i, contact in enumerate(to_delete, 1):
+            contact_id = contact.get('id')
+            email = contact.get('email', 'unknown')
+            
+            if self._delete_contact(contact_id):
+                deleted_count += 1
+                logger.info(f"Deleted {i}/{len(to_delete)}: {email}")
+            else:
+                logger.warning(f"Failed to delete {i}/{len(to_delete)}: {email}")
+            
+            time.sleep(0.5)  # Rate limiting
+        
+        logger.info(f"Deletion complete: {deleted_count} contacts removed")
+        return deleted_count
+
+    def _delete_contact(self, contact_id: str) -> bool:
+        """Delete a single contact."""
+        url = f"{self.base_url}/contacts/{contact_id}"
+        
+        try:
+            response = requests.delete(url, headers=self.headers)
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to delete contact {contact_id}: {e}")
+            return False
+
+    def export_label_to_csv(self, label_id: str, output_file: str):
+        """Export all contacts in a label to CSV with all available fields."""
+        contacts = self.get_contacts_in_label(label_id)
+        
+        if not contacts:
+            logger.warning("No contacts to export!")
+            return
+        
+        # Determine all unique fields across all contacts
+        all_fields = set()
+        for contact in contacts:
+            all_fields.update(contact.keys())
+        
+        # Sort fields for consistent output
+        fieldnames = sorted(all_fields)
+        
+        # Write to CSV
+        with open(output_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for contact in contacts:
+                # Flatten nested objects to JSON strings if needed
+                row = {}
+                for field in fieldnames:
+                    value = contact.get(field)
+                    if isinstance(value, (dict, list)):
+                        row[field] = json.dumps(value)
+                    else:
+                        row[field] = value
+                writer.writerow(row)
+        
+        logger.info(f"Exported {len(contacts)} contacts to {output_file}")
+        logger.info(f"Fields included: {len(fieldnames)}")
+
     def _send_contact_with_retry(self, url: str, contact_data: Dict, contact_num: int, email: str) -> bool:
         """Send a single contact with retry logic"""
         max_retries = 3
@@ -284,6 +425,11 @@ def main():
     parser.add_argument("list_name", help="Name of the new list/label to create")
     parser.add_argument("input_file", help="Path to the CSV file")
     parser.add_argument("--api-key", help="Apollo API Key (optional)")
+    parser.add_argument("--cleanup", action="store_true", 
+                       help="Wait 15 min, then delete contacts without name/company enrichment")
+    parser.add_argument("--wait-minutes", type=int, default=15,
+                       help="Minutes to wait before cleanup (default: 15)")
+    parser.add_argument("--export", help="Export enriched contacts to CSV file (e.g., output.csv)")
 
     args = parser.parse_args()
 
@@ -299,8 +445,23 @@ def main():
         logger.error("No valid leads with emails found in the input file. Cannot proceed.")
         sys.exit(1)
 
+    # Step 1: Upload contacts
     label_id, list_name = uploader.create_list(args.list_name)
     uploader.upload_leads(leads, list_name)
+    logger.info("Upload complete.")
+    
+    # Step 2: Optional cleanup (delete unenriched contacts)
+    if args.cleanup:
+        uploader.wait_for_enrichment(args.wait_minutes)
+        deleted = uploader.delete_unenriched_contacts(label_id)
+        logger.info(f"Cleanup complete: {deleted} unenriched contacts removed")
+    
+    # Step 3: Optional export
+    if args.export:
+        output_path = args.export
+        uploader.export_label_to_csv(label_id, output_path)
+        logger.info(f"Export complete: {output_path}")
+    
     logger.info("Job complete.")
 
 if __name__ == "__main__":
