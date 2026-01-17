@@ -1,0 +1,8 @@
+POST /v1/contacts
+{
+  "first_name": "John",
+  "last_name": "Smith", 
+  "email": "john@example.com",
+  "organization_name": "Acme Corp",
+  "run_dedupe": true
+}
